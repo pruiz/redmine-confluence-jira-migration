@@ -4,9 +4,9 @@ import json
 import time
 
 # === Configuration ===
-project_id = '%PROJECT%'
-api_key = '%API-KEY%'
-base_url = '%SITE-URL%'
+project_id = 'verifid'
+api_key = 'd3e6a695b0e5b68539ef19e0801a951a7e338efe'
+base_url = 'https://dev.crt0.net'
 headers = {'X-Redmine-API-Key': api_key}
 
 output_folder = 'redmine_issues'
@@ -41,7 +41,7 @@ while True:
         json_path = os.path.join(output_folder, f'issue_{issue_id}.json')
         txt_path = os.path.join(output_folder, f'issue_{issue_id}.txt')
 
-        issue_url = f'{base_url}/issues/{issue_id}.json?include=journals,attachments'
+        issue_url = f'{base_url}/issues/{issue_id}.json?include=journals,attachments,changesets'
         detail_resp = requests.get(issue_url, headers=headers)
 
         if detail_resp.status_code != 200:
@@ -77,7 +77,18 @@ while True:
                 if notes:
                     f.write(f"\n[{created}] {user}:\n{notes}\n")
 
-        # === Step 2: Download attachments ===
+        # === Step 2: Download issue as PDF ===
+#        pdf_url = f'{base_url}/issues/{issue_id}.pdf'
+#        print(f"   📄 Downloading PDF for issue #{issue_id}")
+#        pdf_resp = requests.get(pdf_url, headers=headers)
+#        if pdf_resp.status_code == 200:
+#            pdf_path = os.path.join(output_folder, f'issue_{issue_id}.pdf')
+#            with open(pdf_path, 'wb') as f:
+#                f.write(pdf_resp.content)
+#        else:
+#            print(f"   ⚠️ Failed to download PDF for issue #{issue_id}: {pdf_resp.status_code}")
+
+        # === Step 3: Download attachments ===
         attachments = full_data.get('attachments', [])
         if attachments:
             attachment_dir = os.path.join(output_folder, f'issue_{issue_id}_attachments')

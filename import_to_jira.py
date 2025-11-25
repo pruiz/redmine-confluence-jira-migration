@@ -5,6 +5,7 @@ import requests
 import time
 import subprocess
 from pprint import pprint
+from datetime import datetime
 
 # === Jira configuration ===
 JIRA_URL = None
@@ -15,9 +16,18 @@ JIRA_PROJECT_KEY = None
 # === Source Redmine issues (txt files for comments, description, and JSON of the issue)===
 redmine_issues_folder = None
 
-auth = (JIRA_USER, JIRA_API_TOKEN)
+auth = None
 
-# === Modify this mapping based on your priority mapping, "REDMINE" : "JIRA"===
+# === Modify this mapping based on your mapping, "REDMINE" : "JIRA"===
+
+issue_type_map = {
+    "Bug" : "Bug",
+    "Feature" : "New Feature",
+    "Support" : "Support",
+    "Task" : "Task",
+    "Incident" : "Incident",
+}
+
 priority_map = {
     "Immediate" : "Immediate",
     "Urgent" : "Urgent",
@@ -33,6 +43,34 @@ status_map = {
     "Feedback" : "WAITING FOR FEEDBACK",
     "Closed" : "CLOSED",
     "Rejected" : "REJECTED",
+}
+
+transitions_map = {
+    "BACKLOG", "Move to Backlog",
+    "REJECTED", "Reject Issue",
+    "ASSIGNED", "Assign Developer",
+    "IN PROGRESS", "Start Work",
+    "IN REVIEW", "Submit to Review",
+    "DEPLOYED", "Approve & Deploy",
+    "RESOLVED", "Mark As Resolved",
+    "CLOSED", "Close Resolved Issue",
+}
+
+transitions_fields = {
+    "ASSIGNED": ["Assignee", "Start date"],
+    "IN PROGRESS": [],
+    "IN REVIEW": ["% Done", "Git Branch / Pull Request"],
+    "DEPLOYED": [],
+    "RESOLVED": ["Resolution"],
+}
+
+resolution_map = {
+    # "N/A" : None --> Does not apply to jira
+    "Done" : "Done",
+    "Won't do" : "Won't Do",
+    "Duplicate" : "Duplicate",
+    "Works For Me" : "Works for me",
+    "Invalid": "Invalid",
 }
 
 user_map = {
@@ -79,7 +117,8 @@ def try_get_field_id_for(field_name):
 
     resp = requests.get(
         f"{JIRA_URL}/rest/api/3/field",
-        auth=auth
+        auth=auth,
+        headers={"Accept": "application/json"}
     )
     if resp.status_code == 200:
         fields = resp.json()
@@ -90,7 +129,6 @@ def try_get_field_id_for(field_name):
                 field_ids[field_name] = id
                 return id
         print(f"⚠️  No Jira field found for '{field_name}'")
-        pprint(fields)
     else:
         print(f"⚠️  Failed to get Jira fields: {resp.text}")
     return None
@@ -100,6 +138,13 @@ def get_field_id_for(field_name):
     if not id:
         raise Exception(f"Field '{field_name}' not found in Jira.")
     return id
+
+
+def get_redmine_custom_field_value(redmine_issue, field_name):
+    for field in redmine_issue.get("custom_fields", []):
+        if field.get("name", None) == field_name:
+            return field.get("value", None)
+    return None
 
 def preprocess_redmine_plaintext(text):
     text = re.sub(r'\[\[([^\]]+)\]\]', r'[\1]', text)
@@ -163,6 +208,7 @@ def textile_to_markdown_with_pandoc(textile_text):
     return proc.stdout.decode('utf-8')
 
 def adf_metadata_table(redmine_issue):
+    customs = ["Resolution", "CC Ticket", "Customer Ticket"]
     fields = [
         ("Redmine ID", redmine_issue.get("id", "")),
         ("Author", redmine_issue.get("author", {}).get("name", "")),
@@ -172,10 +218,14 @@ def adf_metadata_table(redmine_issue):
         ("Assigned To", redmine_issue.get("assigned_to", {}).get("name", "")),
         ("Created", redmine_issue.get("created_on", "")),
         ("Updated", redmine_issue.get("updated_on", "")),
-        ("Resolution", redmine_issue.get("custom_fields", {}).get("value", None))
-        ("CC Ticket", redmine_issue.get("custom_fields", {}).get("CC Ticket", None))
-        ("Customer Ticket", redmine_issue.get("custom_fields", {}).get("Customer Ticket", None))
+        ("Release", redmine_issue.get("fixed_version", {}).get("name", None)),
     ]
+
+    for custom in customs:
+        value = get_redmine_custom_field_value(redmine_issue, custom)
+        if value:
+            fields.append((custom, value))
+
     rows = [
         [
             {"type": "tableCell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": str(k)}]}]},
@@ -197,6 +247,48 @@ def adf_metadata_table(redmine_issue):
             {"type": "tableRow", "content": row}
             for row in rows
         ]
+    }
+
+def adf_changesets_table(redmine_issue):
+    changesets = redmine_issue.get("changesets", [])
+    if not changesets:
+        return None
+
+    print(f"🔍 Found {len(changesets)} changesets for Redmine #{redmine_issue.get('id')}")
+
+    rows = []
+    for cs in changesets:
+        rows.append({
+            "type": "tableRow", 
+            "content": [
+                {"type": "tableCell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "\u200B" + str(cs.get("committed_on", ""))}]}]},
+                {"type": "tableCell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": str(cs.get("revision", ""))}]}]},
+                {"type": "tableCell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "\u200B" + str(cs.get("user", {}).get("name", ""))}]}]}
+            ]
+        })
+        rows.append({
+            "type": "tableRow",
+            "content": [{
+                "type": "tableCell", "attrs": {"colspan": 3},
+                "content": [{
+                    "type": "paragraph", "content": [{"type": "text", "text": str(cs.get("comments", ""))}]
+                }]
+            }]
+        })
+
+    return {
+        "type": "table",
+        "content": [
+            {
+                "type": "tableRow",
+                "content": [
+                    {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Date"}]}]},
+                    {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Revision"}]}]},
+                    {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Author"}]}]},
+                ]
+            }
+        ] + 
+        rows
     }
 
 def try_attach_file_to_jira(issue_key, file_path):
@@ -226,7 +318,10 @@ def attach_file_to_jira(issue_key, file_path):
             print(f"   🔄 Retrying to upload file '{os.path.basename(file_path)}' (Attempt {attempt + 2}/{max_retries})")
             time.sleep(0.5)
 
-def transition_jira_issue_to(issue_key, status_jira):
+def try_get_transition_fields(obj, keys):
+    return {(try_get_field_id_for(k) or k): obj.get(k, None) for k in keys if k in obj}
+
+def transition_jira_issue_to(issue_key, status_jira, fields = {}):
     # Get available transitions
     resp = requests.get(
         f"{JIRA_URL}/rest/api/3/issue/{issue_key}/transitions",
@@ -236,6 +331,8 @@ def transition_jira_issue_to(issue_key, status_jira):
         print(f"\t❌ Failed to get transitions for {issue_key}: {resp.text}")
         return False
 
+    #print(f"\t➡️ Transitions available for issue {issue_key} -> '{resp.json()}'")
+
     transition_id = None
     transitions = resp.json().get('transitions', [])
     for t in transitions:
@@ -243,21 +340,43 @@ def transition_jira_issue_to(issue_key, status_jira):
             transition_id = t['id']
             break
 
+    if not transition_id and status_jira == 'RESOLVED':
+        # Special case: RESOLVED requires multiple transitions
+        return (
+            transition_jira_issue_to(issue_key, 'ASSIGNED', fields) and
+            transition_jira_issue_to(issue_key, 'IN PROGRESS', fields) and
+            transition_jira_issue_to(issue_key, 'IN REVIEW', fields) and
+            transition_jira_issue_to(issue_key, 'DEPLOYED', fields) and
+            transition_jira_issue_to(issue_key, 'RESOLVED', fields)
+        )
+
+    if not transition_id and status_jira == 'CLOSED':
+        # Special case: CLOSED requires RESOLVED first
+        return (
+            transition_jira_issue_to(issue_key, 'RESOLVED', fields) and
+            transition_jira_issue_to(issue_key, 'CLOSED', fields)
+        )
+
     if not transition_id:
         print(f"\t⚠️  No transition found for status '{status_jira}' on issue {issue_key}")
         return False
+
+    payload = {
+        "transition": {"id": transition_id},
+        "fields": try_get_transition_fields(fields, transitions_fields.get(status_jira, []))
+    }
 
     # Perform the transition
     resp2 = requests.post(
         f"{JIRA_URL}/rest/api/3/issue/{issue_key}/transitions",
         auth=auth,
-        json={"transition": {"id": transition_id}}
+        json=payload
     )
     if resp2.status_code in (200, 204):
         print(f"\t✅ Transitioned issue {issue_key} to '{status_jira}'")
         return True
     else:
-        print(f"\t❌ Failed to transition issue {issue_key}: {resp2.text}")
+        print(f"\t❌ Failed to transition issue {issue_key} to {status_jira}: {payload} => {resp2.text}")
         return False
 
 def create_jira_issue(redmine_issue):
@@ -276,12 +395,21 @@ def create_jira_issue(redmine_issue):
     adf_content.append(adf_metadata_table(redmine_issue))    
     adf_content.extend(adf_paragraphs_from_markdown(description_markdown))
 
+    if redmine_issue.get("changesets", None):
+        adf_content.append(adf_heading("Changesets.."))
+        adf_content.append(adf_changesets_table(redmine_issue))    
+
     # Always attach the .txt and comments.txt for each issue
     issue_id = redmine_issue.get('id')
+    created_on_str = redmine_issue.get('created_on', None)
+    created_on = datetime.strptime(created_on_str, "%Y-%m-%dT%H:%M:%SZ")
+    updated_on_str = redmine_issue.get('updated_on', None)
+    updated_on = datetime.strptime(updated_on_str, "%Y-%m-%dT%H:%M:%SZ") if updated_on_str else None
     txt_path = os.path.join(redmine_issues_folder, f"issue_{issue_id}.txt")
     comments_txt_path = os.path.join(redmine_issues_folder, f"issue_{issue_id}_comments.txt")
 
     # Prepare main Jira issue payload
+    kind = redmine_issue.get('tracker', {}).get('name', 'Task')
     status = redmine_issue.get('status', {}).get('name', 'New')
     status_jira = status_map.get(status, "NEW")
     priority = redmine_issue.get('priority', {}).get('name', 'Medium')
@@ -291,16 +419,17 @@ def create_jira_issue(redmine_issue):
     assignee = redmine_issue.get('assigned_to', {}).get('name', None)
     assignee_id = try_get_user_id_for(assignee) if assignee else None
     redmineid_fieldid = get_field_id_for("Redmine ID")
-
+    environment_fieldid = get_field_id_for("Environment")
+    environment = get_redmine_custom_field_value(redmine_issue, "Environment")
 
     print(f"➡️ Creating Jira issue for Redmine #{issue_id}: {assignee} / {reporter} / Status: {status_jira} / Priority: {priority_jira}")
 
-    # TODO: Map other fields as needed
-    #   - Assignee (only for open issues)
+    # Map other fields as needed
+    #   - Assignee (only for open issues) - done
     #   - Created/Updated dates [to reflect originals] - Not possible
-    #   - Git branch / pull request links if applicable
-    #   - Labels, Components, etc.
-    #   - Environment
+    #   - Git branch / pull request links if applicable - done
+    #   - Labels, Components, etc. - done
+    #   - Environment - done
     payload = {
         "fields": {
             "project": {"key": JIRA_PROJECT_KEY},
@@ -310,7 +439,7 @@ def create_jira_issue(redmine_issue):
                 "version": 1,
                 "content": adf_content
             },
-            "issuetype": {"name": "Task"},
+            "issuetype": {"name": issue_type_map.get(kind, "Task")},
             "priority": {"name": priority_jira},
             redmineid_fieldid: str(issue_id),
         }
@@ -320,32 +449,47 @@ def create_jira_issue(redmine_issue):
     if reporter_id:
         payload["fields"]["reporter"] = {"id": reporter_id}
 
-    if assignee_id and status_jira not in ['REJECTED', 'RESOLVED', 'CLOSED']:
+    if assignee_id and status_jira not in ['REJECTED', 'CLOSED']:
         payload["fields"]["assignee"] = {"id": assignee_id}
 
-    server = redmine_issue.get('custom_fields', {}).get('Server', None)
+    server = get_redmine_custom_field_value(redmine_issue, "Server")
     if server:
         server_fieldid = get_field_id_for("Server")
         payload["fields"][server_fieldid] = server
    
-    gitbranch = redmine_issue.get('custom_fields', {}).get('Git Branch', None)
+    gitbranch = get_redmine_custom_field_value(redmine_issue, "Git Branch")
     if gitbranch:
         gitbranch_fieldid = get_field_id_for("Git Branch / Pull Request")
         payload["fields"][gitbranch_fieldid] = gitbranch
 
-    component = redmine_issue.get('custom_fields', {}).get('Component', None)
+    component = get_redmine_custom_field_value(redmine_issue, "Component")
     if component:
         component_fieldid = get_field_id_for("Components")
         payload["fields"][component_fieldid] = component
 
-    external_ticket = redmine_issue.get('custom_fields', {}).get('Customer Ticket', None) or redmine_issue.get('custom_fields', {}).get('CC Ticket', None)
+    external_id = get_redmine_custom_field_value(redmine_issue, "Customer Ticket")
+    if external_id:
+        external_id_fieldid = get_field_id_for("Customer Ticket / External Reference")
+        payload["fields"][external_id_fieldid] = external_id
+
+    external_ticket = get_redmine_custom_field_value(redmine_issue, "CC Ticket")
     if external_ticket:
-        external_ticket_fieldid = get_field_id_for("External Ticket")
+        external_ticket_fieldid = get_field_id_for("External ID")
         payload["fields"][external_ticket_fieldid] = external_ticket
 
     if status_jira in ['REJECTED', 'RESOLVED', 'CLOSED']:
         donepct_fieldid = get_field_id_for("% Done")
         payload["fields"][donepct_fieldid] = 100
+        # Disable QA Review, so we can trransition to correct state
+        payload["fields"][get_field_id_for('QA Review')] = { "value": "No" }
+
+
+    if kind == 'Bug' and not environment:
+        print("⚠️  Bug issue without Environment, setting to 'Dev'")
+        environment = " Dev "
+
+    if environment:
+        payload["fields"][environment_fieldid] = { "name": environment }
 
     resp = requests.post(
         f"{JIRA_URL}/rest/api/3/issue",
@@ -389,7 +533,6 @@ def create_jira_issue(redmine_issue):
             attach_file_to_jira(issue_key, txt_path)
         if os.path.exists(comments_txt_path):
             attach_file_to_jira(issue_key, comments_txt_path)
-        return issue_key
     else:
         print(f"❌ Failed to create Jira issue for Redmine #{issue_id}: {resp.text}")
         #print(f"❌ Failed to create Jira issue for Redmine #{issue_id}: {resp.text}\n- request:\n{json.dumps(payload, indent=2)}")
@@ -397,9 +540,20 @@ def create_jira_issue(redmine_issue):
 
     # Now let's update status..
     if status_jira in ['REJECTED', 'RESOLVED', 'CLOSED']:
-        transition_jira_issue_to(issue_key, status_jira)
+        fields = {
+            'Assignee': { "id": (assignee_id or assignee_id or try_get_user_id_for(JIRA_USER)) },
+            'Start date': (updated_on if updated_on else created_on).strftime("%Y-%m-%d"),
+            '% Done': 100,
+            'Git Branch / Pull Request': (gitbranch or '*missing*'),
+            'Resolution' : { "name": resolution_map.get(get_redmine_custom_field_value(redmine_issue, "Resolution"), None) },
+        }
+        if not transition_jira_issue_to(issue_key, status_jira, fields):
+            raise Exception("Failed to transition issue")
     elif redmine_issue.get('fixed_version', {}).get('name', None) == 'Backlog':
-        transition_jira_issue_to(issue_key, 'BACKLOG')
+        if not transition_jira_issue_to(issue_key, 'BACKLOG'):
+            raise Exception("Failed to transition issue")
+
+    return issue_key
 
 
 def upload_attachments_to_jira(issue_key, attachment_folder):
@@ -439,6 +593,35 @@ def check_jira_issue_exists(redmine_issue):
         print(f"⚠️  Failed to search Jira issues for Redmine ID '{issue_id}': {resp.text}")
         return False
 
+def maybe_get_jiraids_for(redmine_issue):
+    redmineid_fieldid = get_field_id_for("Redmine ID")
+    issue_id = redmine_issue.get('id')
+    jql = f'"{redmineid_fieldid}" ~ "{issue_id}"'
+    resp = requests.post(
+        f"{JIRA_URL}/rest/api/3/search/jql",
+        auth=auth,
+        headers={"Content-Type": "application/json"},
+        json={"jql": jql}
+    )
+    print(f"🔍 Searching for Jira issues with Redmine ID '{issue_id}' -> {resp.json()}")
+    if resp.status_code == 200:
+        issues = resp.json().get('issues', [])
+        if issues:
+            return [issue['id'] for issue in issues]
+    return None
+
+def delete_jira_issue(issue_key):
+    resp = requests.delete(
+        f"{JIRA_URL}/rest/api/3/issue/{issue_key}",
+        auth=auth
+    )
+    if resp.status_code == 204:
+        print(f"🗑️  Deleted existing Jira issue {issue_key}")
+        return
+
+    print(f"⚠️  Failed to delete Jira issue {issue_key}: {resp.status_code} -> {resp.text}")
+    raise Exception(f"Failed to delete Jira issue {resp.status_code} -> {issue_key}")
+
 # Parse arguments:
 #  --input => path to folder with Redmine issues (default: 'redmine-issues')
 #  --jira-url => Jira instance URL
@@ -449,6 +632,8 @@ def check_jira_issue_exists(redmine_issue):
 #  --errorlog => path to log file for errors
 #  --skip-closed => skip closed issues
 #  --issue-id => only import specific issue ID
+#  --overwrite => overwrite (delete+create) existing issues
+#  --fail-fast => stop on first error
 #  --help => show this help
 def parse_args():
     import argparse
@@ -462,6 +647,8 @@ def parse_args():
     parser.add_argument("--errorlog", type=str, help="Path to log file for errors")
     parser.add_argument("--skip-closed", action="store_true", help="Skip closed issues")
     parser.add_argument("--issue-id", type=int, help="Only import specific issue ID")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite (delete+create) existing issues")
+    parser.add_argument("--fail-fast", action="store_true", help="Stop on first error")
     return parser.parse_args()
 
 def readfile(path):
@@ -469,7 +656,7 @@ def readfile(path):
         return f.read_text().strip()
 
 def main():
-    global JIRA_URL, JIRA_USER, JIRA_API_TOKEN, JIRA_PROJECT_KEY, redmine_issues_folder
+    global JIRA_URL, JIRA_USER, JIRA_API_TOKEN, JIRA_PROJECT_KEY, redmine_issues_folder, auth
     args = parse_args()
 
     JIRA_URL = args.jira_url
@@ -477,7 +664,7 @@ def main():
     JIRA_API_TOKEN = readfile(args.jira_token.lstrip('@')) if args.jira_token.startswith('@') else args.jira_token
     JIRA_PROJECT_KEY = args.jira_project
     redmine_issues_folder = args.input
-
+    auth = (JIRA_USER, JIRA_API_TOKEN)
     # read user mappings from 'emails.csv', if present on script's folder
     if args.emails:
         emails_csv_path = os.path.join(os.path.dirname(__file__), args.emails)
@@ -511,7 +698,11 @@ def main():
                 print(f"⏭️  Skipping closed issue Redmine #{redmine_issue.get('id')} with status '{status}'")
                 continue
 
-        if check_jira_issue_exists(redmine_issue): 
+        if args.overwrite:
+            ids = maybe_get_jiraids_for(redmine_issue)
+            for id in ids or []:
+                delete_jira_issue(id)
+        elif check_jira_issue_exists(redmine_issue): 
             print(f"⏭️  Jira issue already exists for Redmine #{redmine_issue.get('id')}, skipping.")
             continue
 
@@ -522,6 +713,9 @@ def main():
                 f"issue_{redmine_issue['id']}_attachments"
             )
             upload_attachments_to_jira(issue_key, attachment_dir)
+        elif args.fail_fast:
+            print(f"❌ Failing fast due to error on Redmine #{redmine_issue.get('id')}")
+            raise Exception(f"Failed to import Redmine issue #{redmine_issue.get('id')}")
         elif errfile:
             errfile.write(f"Failed to import Redmine issue #{redmine_issue.get('id')}\n")
         time.sleep(0.6)  # Polite delay
