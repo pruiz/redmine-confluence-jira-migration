@@ -62,12 +62,14 @@ transitions_fields = {
     "IN REVIEW": ["% Done", "Git Branch / Pull Request"],
     "DEPLOYED": [],
     "RESOLVED": ["Resolution"],
+    "REJECTED": ["Resolution", "Priority Reason / Notes:"],
+    "CLOSED": ["Resolution"],
 }
 
 resolution_map = {
     # "N/A" : None --> Does not apply to jira
     "Done" : "Done",
-    "Won't do" : "Won't Do",
+    "Won't Do" : "Won't Do",
     "Duplicate" : "Duplicate",
     "Works For Me" : "Works for me",
     "Invalid": "Invalid",
@@ -158,6 +160,14 @@ def preprocess_redmine_plaintext(text):
     text = re.sub(r'(\r\n|\r|\n){2,}', '\n\n', text)
     return text
 
+def textile_to_markdown_with_pandoc(textile_text):
+    proc = subprocess.run(
+        ['pandoc', '--from=textile', '--to=markdown'],
+        input=textile_text.encode('utf-8'),
+        stdout=subprocess.PIPE
+    )
+    return proc.stdout.decode('utf-8')
+
 def adf_heading(text, level=3):
     return {
         "type": "heading",
@@ -189,6 +199,20 @@ def adf_infobox(text):
         ]
     }
 
+def adf_basic_document(text):
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": text}
+                ]
+            }
+        ]
+    }
+
 def adf_paragraphs_from_markdown(md):
     paragraphs = [p.strip() for p in md.strip().split('\n\n') if p.strip()]
     return [
@@ -198,14 +222,6 @@ def adf_paragraphs_from_markdown(md):
         }
         for p in paragraphs
     ]   
-
-def textile_to_markdown_with_pandoc(textile_text):
-    proc = subprocess.run(
-        ['pandoc', '--from=textile', '--to=markdown'],
-        input=textile_text.encode('utf-8'),
-        stdout=subprocess.PIPE
-    )
-    return proc.stdout.decode('utf-8')
 
 def adf_metadata_table(redmine_issue):
     customs = ["Resolution", "CC Ticket", "Customer Ticket"]
@@ -421,6 +437,7 @@ def create_jira_issue(redmine_issue):
     redmineid_fieldid = get_field_id_for("Redmine ID")
     environment_fieldid = get_field_id_for("Environment")
     environment = get_redmine_custom_field_value(redmine_issue, "Environment")
+    resolution = get_redmine_custom_field_value(redmine_issue, "Resolution")
 
     print(f"➡️ Creating Jira issue for Redmine #{issue_id}: {assignee} / {reporter} / Status: {status_jira} / Priority: {priority_jira}")
 
@@ -482,14 +499,18 @@ def create_jira_issue(redmine_issue):
         payload["fields"][donepct_fieldid] = 100
         # Disable QA Review, so we can trransition to correct state
         payload["fields"][get_field_id_for('QA Review')] = { "value": "No" }
+        # Set resolution as it is needed by Jira to close issues
 
+    if resolution and resolution != "N/A":
+        payload["fields"]["resolution"] = { "name": resolution_map.get(resolution) }
 
     if kind == 'Bug' and not environment:
         print("⚠️  Bug issue without Environment, setting to 'Dev'")
-        environment = " Dev "
+        environment = "Dev"
 
     if environment:
-        payload["fields"][environment_fieldid] = { "name": environment }
+        print(f"🔍 Setting Environment ({environment_fieldid}) field to '{environment}'")
+        payload["fields"][environment_fieldid] = { "value": environment }
 
     resp = requests.post(
         f"{JIRA_URL}/rest/api/3/issue",
@@ -545,7 +566,8 @@ def create_jira_issue(redmine_issue):
             'Start date': (updated_on if updated_on else created_on).strftime("%Y-%m-%d"),
             '% Done': 100,
             'Git Branch / Pull Request': (gitbranch or '*missing*'),
-            'Resolution' : { "name": resolution_map.get(get_redmine_custom_field_value(redmine_issue, "Resolution"), None) },
+            'Resolution' : { "name": resolution_map.get(get_redmine_custom_field_value(redmine_issue, "Resolution"), "Done") },
+            'Priority Reason / Notes:' : adf_basic_document(f"Imported from Redmine with priority '{priority}', see details in issue body."),
         }
         if not transition_jira_issue_to(issue_key, status_jira, fields):
             raise Exception("Failed to transition issue")
@@ -632,6 +654,7 @@ def delete_jira_issue(issue_key):
 #  --errorlog => path to log file for errors
 #  --skip-closed => skip closed issues
 #  --issue-id => only import specific issue ID
+#  --start-id => start importing from specific Redmine issue ID
 #  --overwrite => overwrite (delete+create) existing issues
 #  --fail-fast => stop on first error
 #  --help => show this help
@@ -647,6 +670,7 @@ def parse_args():
     parser.add_argument("--errorlog", type=str, help="Path to log file for errors")
     parser.add_argument("--skip-closed", action="store_true", help="Skip closed issues")
     parser.add_argument("--issue-id", type=int, help="Only import specific issue ID")
+    parser.add_argument("--start-id", type=int, help="Start importing from specific Redmine issue ID")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite (delete+create) existing issues")
     parser.add_argument("--fail-fast", action="store_true", help="Stop on first error")
     return parser.parse_args()
@@ -654,6 +678,13 @@ def parse_args():
 def readfile(path):
     with open(path, "r", encoding="utf-8") as f:
         return f.read_text().strip()
+
+def extract_issueid_from(filename):
+    # Extract trailing number before extension
+    m = re.search(r'(\d+)(?=\.\w+$)', filename)
+    if m:
+        return int(m.group(1))
+    return float('inf')
 
 def main():
     global JIRA_URL, JIRA_USER, JIRA_API_TOKEN, JIRA_PROJECT_KEY, redmine_issues_folder, auth
@@ -683,7 +714,7 @@ def main():
      
     errfile =  open(args.errorlog, "a", encoding="utf-8") if args.errorlog else None
 
-    for fname in os.listdir(redmine_issues_folder):
+    for fname in sorted(os.listdir(redmine_issues_folder), key=extract_issueid_from):
         if not fname.endswith(".json"):
             continue
         with open(os.path.join(redmine_issues_folder, fname), "r", encoding="utf-8") as f:
