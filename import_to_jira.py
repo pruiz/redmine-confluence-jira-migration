@@ -73,6 +73,8 @@ resolution_map = {
     "Duplicate" : "Duplicate",
     "Works For Me" : "Works for me",
     "Invalid": "Invalid",
+    "Fixed": "Done",
+    "Won't Fix": "Won't Do",
 }
 
 user_map = {
@@ -118,21 +120,42 @@ def try_get_field_id_for(field_name):
         return field_ids[field_name]
 
     resp = requests.get(
+        f"{JIRA_URL}/rest/api/3/issue/createmeta?projectKeys={JIRA_PROJECT_KEY}&expand=projects.issuetypes.fields",
+        auth=auth,
+        headers={"Accept": "application/json"}
+    )
+    if resp.status_code == 200:
+        for t in resp.json().get('projects', [])[0].get('issuetypes', []):
+            for fname, fdata in t.get('fields', {}).items():
+                if fdata.get('name', '') == field_name:
+                    id = fname
+                    print(f"🔍 Found Jira field-id for '{field_name}' (issuetype: {t.get('name', None)}: {id} and added to cache.")
+                    field_ids[field_name] = id
+                    return id
+    else:
+        print(f"⚠️  Failed to get createmeta for project '{JIRA_PROJECT_KEY}': {resp.text}")
+
+    # If no match, let's fallback to find against global fields list
+    resp = requests.get(
         f"{JIRA_URL}/rest/api/3/field",
         auth=auth,
         headers={"Accept": "application/json"}
     )
     if resp.status_code == 200:
-        fields = resp.json()
-        for field in fields:
-            if field['name'] == field_name:
-                id = field['id']
+        for f in resp.json():
+            if f.get('name', '') == field_name:
+                id = f.get('id', None)
                 print(f"🔍 Found Jira field-id for '{field_name}': {id} and added to cache.")
                 field_ids[field_name] = id
                 return id
-        print(f"⚠️  No Jira field found for '{field_name}'")
     else:
-        print(f"⚠️  Failed to get Jira fields: {resp.text}")
+        print(f"⚠️  Failed to get fields list: {resp.text}")
+
+    # If field_name ends in ':', try without it
+    if field_name.endswith(':'):
+        return try_get_field_id_for(field_name[:-1])
+
+    print(f"⚠️  No Jira field found for '{field_name}'")
     return None
 
 def get_field_id_for(field_name):
@@ -235,6 +258,7 @@ def adf_metadata_table(redmine_issue):
         ("Created", redmine_issue.get("created_on", "")),
         ("Updated", redmine_issue.get("updated_on", "")),
         ("Release", redmine_issue.get("fixed_version", {}).get("name", None)),
+        ("Git Branch", get_redmine_custom_field_value(redmine_issue, "Git Branch"))
     ]
 
     for custom in customs:
@@ -332,12 +356,12 @@ def attach_file_to_jira(issue_key, file_path):
             return
         else:
             print(f"   🔄 Retrying to upload file '{os.path.basename(file_path)}' (Attempt {attempt + 2}/{max_retries})")
-            time.sleep(0.5)
+            time.sleep(attempt)
 
 def try_get_transition_fields(obj, keys):
     return {(try_get_field_id_for(k) or k): obj.get(k, None) for k in keys if k in obj}
 
-def transition_jira_issue_to(issue_key, status_jira, fields = {}):
+def try_get_transitions_for(issue_key, status_jira):
     # Get available transitions
     resp = requests.get(
         f"{JIRA_URL}/rest/api/3/issue/{issue_key}/transitions",
@@ -355,6 +379,13 @@ def transition_jira_issue_to(issue_key, status_jira, fields = {}):
         if t['to']['name'].upper() == status_jira:
             transition_id = t['id']
             break
+
+    return transition_id
+
+def transition_jira_issue_to(issue_key, status_jira, fields = {}):
+    retries = 5
+
+    transition_id = try_get_transitions_for(issue_key, status_jira)
 
     if not transition_id and status_jira == 'RESOLVED':
         # Special case: RESOLVED requires multiple transitions
@@ -374,7 +405,7 @@ def transition_jira_issue_to(issue_key, status_jira, fields = {}):
         )
 
     if not transition_id:
-        print(f"\t⚠️  No transition found for status '{status_jira}' on issue {issue_key}")
+        print(f"\t⚠️  No transition found for status '{status_jira}' on issue {issue_key}, and no more retrues left..")
         return False
 
     payload = {
@@ -390,6 +421,7 @@ def transition_jira_issue_to(issue_key, status_jira, fields = {}):
     )
     if resp2.status_code in (200, 204):
         print(f"\t✅ Transitioned issue {issue_key} to '{status_jira}'")
+        time.sleep(0.350) # small delay to avoid eventual consistency issues
         return True
     else:
         print(f"\t❌ Failed to transition issue {issue_key} to {status_jira}: {payload} => {resp2.text}")
@@ -439,7 +471,7 @@ def create_jira_issue(redmine_issue):
     environment = get_redmine_custom_field_value(redmine_issue, "Environment")
     resolution = get_redmine_custom_field_value(redmine_issue, "Resolution")
 
-    print(f"➡️ Creating Jira issue for Redmine #{issue_id}: {assignee} / {reporter} / Status: {status_jira} / Priority: {priority_jira}")
+    print(f"➡️ Creating Jira issue for Redmine {kind} #{issue_id}: {assignee} / {reporter} / Status: {status_jira} / Priority: {priority_jira}")
 
     # Map other fields as needed
     #   - Assignee (only for open issues) - done
@@ -476,6 +508,8 @@ def create_jira_issue(redmine_issue):
    
     gitbranch = get_redmine_custom_field_value(redmine_issue, "Git Branch")
     if gitbranch:
+        if len(gitbranch) > 255:
+            gitbranch = gitbranch[:252] + "..."
         gitbranch_fieldid = get_field_id_for("Git Branch / Pull Request")
         payload["fields"][gitbranch_fieldid] = gitbranch
 
@@ -512,12 +546,17 @@ def create_jira_issue(redmine_issue):
         print(f"🔍 Setting Environment ({environment_fieldid}) field to '{environment}'")
         payload["fields"][environment_fieldid] = { "value": environment }
 
+    #print(f"📦 Payload prepared for Redmine #{issue_id}, creating Jira issue.. fields {(payload['fields']['customfield_13362'])}")
+
     resp = requests.post(
         f"{JIRA_URL}/rest/api/3/issue",
         auth=auth,
         headers={"Content-Type": "application/json"},
         json=payload
     )
+
+    with open("request.json", "w", encoding="utf-8") as f:
+        f.write(json.dumps(payload, indent=2))
 
     # Fallback: If description too long, only add metadata and summary
     if resp.status_code not in (200, 201) and "CONTENT_LIMIT_EXCEEDED" in resp.text:
@@ -709,7 +748,7 @@ def main():
                 parts = line.strip().split(",")
                 if len(parts) == 2:
                     user, email = parts
-                    user_map[user.strip()] = email.strip()
+                    user_map[user.strip()] = email.strip() if email != "" else None
             print(f"🔍 Loaded {len(user_map)} user mappings from 'emails.csv'.")
      
     errfile =  open(args.errorlog, "a", encoding="utf-8") if args.errorlog else None
@@ -723,6 +762,10 @@ def main():
         if args.issue_id and redmine_issue.get('id') != args.issue_id:
             continue
 
+        if args.start_id and redmine_issue.get('id') < args.start_id:
+            print(f"⏭️  Skipping Redmine #{redmine_issue.get('id')} (before start-id {args.start_id})")
+            continue
+
         if args.skip_closed:
             status = redmine_issue.get('status', {}).get('name', 'New')
             if status in ['Closed', 'Rejected']:
@@ -731,6 +774,7 @@ def main():
 
         if args.overwrite:
             ids = maybe_get_jiraids_for(redmine_issue)
+            print(f"🗑️  Overwrite enabled, deleting existing Jira issues for Redmine #{redmine_issue.get('id')} -> {ids}")
             for id in ids or []:
                 delete_jira_issue(id)
         elif check_jira_issue_exists(redmine_issue): 

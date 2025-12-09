@@ -4,8 +4,8 @@ import json
 import time
 
 # === Configuration ===
-project_id = 'verifid'
-api_key = 'd3e6a695b0e5b68539ef19e0801a951a7e338efe'
+project_id = 'evidevs'
+api_key = 'N/A'
 base_url = 'https://dev.crt0.net'
 headers = {'X-Redmine-API-Key': api_key}
 
@@ -21,7 +21,7 @@ print(f"\U0001F4E5 Starting to fetch issues from '{project_id}'")
 
 # === Step 1: Paginate through all issues (including closed) ===
 while True:
-    url = f'{base_url}/issues.json?project_id={project_id}&status_id=*&offset={offset}&limit={limit}'
+    url = f'{base_url}/issues.json?project_id={project_id}&status_id=*&sort=id:asc&offset={offset}&limit={limit}'
     response = requests.get(url, headers=headers)
 
     if response.status_code != 200:
@@ -46,7 +46,9 @@ while True:
 
         if detail_resp.status_code != 200:
             print(f"⚠️ Failed to get full data for issue #{issue_id}")
-            continue
+            raise Exception(f"Failed to get issue #{issue_id}: {detail_resp.status_code}")
+
+        print(f"   📝 Processing issue #{issue_id}")
 
         full_data = detail_resp.json().get('issue', {})
         all_issues.append(full_data)
@@ -108,8 +110,9 @@ while True:
                         f.write(att_resp.content)
                 else:
                     print(f"   ⚠️ Failed to download attachment '{filename}': {att_resp.status_code}")
+                    raise Exception(f"Failed to download attachment '{filename}'")
 
     offset += limit
-    time.sleep(1.5)  # Polite delay to avoid hammering the server
+    time.sleep(0.5)  # Polite delay to avoid hammering the server
 
 print(f"\n✅ Completed. Total issues downloaded: {len(all_issues)}")
