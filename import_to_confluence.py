@@ -8,6 +8,7 @@ from pprint import pprint
 from atlassian import Confluence
 from bs4 import BeautifulSoup
 from bs4.element import CData
+from time import sleep
 
 # === Confluence configuration ===
 CONFLUENCE_URL = None
@@ -17,6 +18,8 @@ CONFLUENCE_SPACE_ID = None
 CONFLUENCE_SPACE_KEY = None
 CONFLUENCE_PARENT_FOLDER = None
 CONFLUENCE_PAGE_ROOT = None
+CONFLUENCE_OVERWRITE_EXISTING = []
+CONFLUENCE_TITLE_SUFFIX = "Legacy"
 REDMINE_ORIGIN_URL = None
 PAGES = None
 FAIL_FAST = False
@@ -83,6 +86,8 @@ def html_replace_img_with_confluence_macro(html, attachments):
             return match.group(0)
     return re.sub(r'<img[^>]+src=[\'"]([^\'"]+)[\'"][^>]*>', replacer, html)
 
+RE_HEAD_PREFIX = re.compile(r'^\d+\.')
+
 def html_convert_links(html):
     """
     Make links clicable, convert links from redmine style to confluence style
@@ -92,6 +97,29 @@ def html_convert_links(html):
     convert it to jira issue link / search (by RedmineID).
     """
     soup = BeautifulSoup(html, 'html.parser')
+
+    # Find text like '[[Page Name]]' and '[[Page Name|Link Text]]' and convert to confluence links
+    pattern = re.compile(r'\[\[([^\|\]]+)(\|([^\]]+))?\]\]')
+    for text_node in soup.find_all(string=pattern):
+        new_content = text_node
+        for match in pattern.finditer(text_node):
+            page_name = match.group(1).strip().rstrip(':').replace('/', '').replace(' ', '_')
+            link_text = match.group(3).strip() if match.group(3) else page_name
+            link_text = link_text.replace('[', '(').replace(']', ')')
+
+            if RE_HEAD_PREFIX.match(page_name):
+                page_name = page_name.lstrip('0123456789.').strip()
+
+            confluence_link = (
+                f'<ac:link>'
+                    f'<ri:page ri:content-title="{page_name} ({CONFLUENCE_TITLE_SUFFIX})"/>'
+                    f'<ac:plain-text-link-body><![CDATA[{link_text}]]></ac:plain-text-link-body>'
+                f'</ac:link>'
+            )
+            new_content = new_content.replace(match.group(0), confluence_link)
+        new_soup = BeautifulSoup(new_content, 'html.parser')
+        text_node.replace_with(new_soup)
+ 
     for a in soup.find_all('a', href=True):
         # If a-href is under a <code>, <pre> or <notextile>, ignore it..
         parent_tags = [parent.name for parent in a.parents]
@@ -103,12 +131,12 @@ def html_convert_links(html):
             rel_link = href.replace(REDMINE_ORIGIN_URL, '')
             if rel_link.startswith('/projects/') and '/wiki/' in rel_link:
                 # Replace '<a href="...">...</a>' with confluence <ac:link> macro
-                page_name = rel_link.split('/wiki/')[-1].strip().rstrip(':')
+                page_name = rel_link.split('/wiki/')[-1].strip().rstrip(':').replace('/', '').replace(' ', '_')
                 #page_name = page_name.replace(' ', '+').replace('_', '+')
                 link_name = page_name.replace('[', '(').replace(']', ')')
                 html = (
                     f'<ac:link>'
-                        f'<ri:page ri:content-title="{page_name} (Legacy)"/>'
+                        f'<ri:page ri:content-title="{page_name} ({CONFLUENCE_TITLE_SUFFIX})"/>'
                         f'<ac:plain-text-link-body><![CDATA[{link_name}]]></ac:plain-text-link-body>'
                     f'</ac:link>'
                 )
@@ -125,32 +153,27 @@ def html_convert_links(html):
         r'https?://[^\s<>"\')]+'
     )
     for url in soup.find_all(string=url_pattern):
-        new_content = url
-        for match in url_pattern.finditer(url):
+        # Skip nodes inside tags where we must not touch content (prevents self-linking loops)
+        parent_tags = [parent.name for parent in url.parents]
+        if 'a' in parent_tags or 'code' in parent_tags or 'pre' in parent_tags or 'notextile' in parent_tags:
+            continue
+
+        # Skip nodes inside plain-text-link-body (Confluence link bodies)
+        if 'ac:plain-text-link-body' in parent_tags or 'ac:link' in parent_tags:
+            continue
+
+        if 'script' in parent_tags or 'style' in parent_tags:
+            continue
+
+        new_content = str(url)  # IMPORTANT: work on a plain string
+        for match in url_pattern.finditer(new_content):
             link = match.group(0)
             link_html = f'<a href="{link}">{link}</a>'
             new_content = new_content.replace(link, link_html)
-        new_soup = BeautifulSoup(new_content, 'html.parser')
-        url.replace_with(new_soup)
 
-    # Find text like '[[Page Name]]' and '[[Page Name|Link Text]]' and convert to confluence links
-    pattern = re.compile(r'\[\[([^\|\]]+)(\|([^\]]+))?\]\]')
-    for text_node in soup.find_all(string=pattern):
-        new_content = text_node
-        for match in pattern.finditer(text_node):
-            page_name = match.group(1).strip().rstrip(':')
-            link_text = match.group(3).strip() if match.group(3) else page_name
-            link_text = link_text.replace('[', '(').replace(']', ')')
-            confluence_link = (
-                f'<ac:link>'
-                    f'<ri:page ri:content-title="{page_name} (Legacy)"/>'
-                    f'<ac:plain-text-link-body><![CDATA[{link_text}]]></ac:plain-text-link-body>'
-                f'</ac:link>'
-            )
-            new_content = new_content.replace(match.group(0), confluence_link)
-        new_soup = BeautifulSoup(new_content, 'html.parser')
-        text_node.replace_with(new_soup)
-           
+        if new_content != str(url):
+            new_soup = BeautifulSoup(new_content, 'html.parser')
+            url.replace_with(new_soup)
 
     result = str(soup)
 
@@ -255,6 +278,92 @@ def convert_code_blocks(html: str) -> str:
 
     return soup.encode(formatter=None).decode("utf-8")
 
+
+PLANTUML_HTML_RE = re.compile(r"\{\{plantuml\b(.*?)\}\}", re.IGNORECASE | re.DOTALL)
+
+def convert_plantuml_blocks(html: str) -> str:
+    results = []
+    def repl(m: re.Match) -> str:
+        inner = m.group(1)
+
+        # Turn HTML line breaks into real newlines
+        inner = re.sub(r"(?is)<br\s*/?>", "\n", inner)
+
+        # Paragraph breaks to newlines
+        inner = re.sub(r"(?is)</p>\s*<p[^>]*>", "\n", inner)
+
+        # Drop any remaining tags inside the block
+        inner = re.sub(r"(?is)<[^>]+>", "", inner)
+
+        # Convert <code>...</code> if present
+        inner = inner.replace('<code>', '@')
+        inner = inner.replace('</code>', '@')
+
+        # Remove the leading newline(s) / spaces after {{plantuml
+        code = inner.strip()
+        code = code.replace("\r\n", "\n").replace("\r", "\n")
+
+        # Normalize some common unicode characters to ascii equivalents
+        code = (code
+            .replace("\u201c", '"')  # “
+            .replace("\u201d", '"')  # ”
+            .replace("’", "'")
+            .replace("→", "->")
+            .replace("—>", "-->")
+            .replace("–>", "-->")
+            .replace("—", "-")
+            .replace("–", "-")
+        )
+
+        if not code.startswith("@startuml"):
+            code = "@startuml\n" + code
+        if not code.endswith("@enduml") or code.endswith("@enduml\n"):
+            code = code + "\n@enduml"
+
+        results.append(code)
+        code = _safe_cdata(code)
+
+        return (
+            '<ac:structured-macro ac:name="plantuml-code">'
+            f'<ac:plain-text-body><![CDATA[{code}]]></ac:plain-text-body>'
+            '</ac:structured-macro>'
+        )
+
+    return (PLANTUML_HTML_RE.sub(repl, html), results)
+
+def save_plantuml_diagrams(pagename, diagrams, wiki_dir):
+    """ Saves PlantUML diagrams to files in output_dir, using pagename as base name. """
+    output_dir = os.path.join(wiki_dir, f"{pagename}_diagrams")
+    result = []
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    for idx, diagram_code in enumerate(diagrams):
+        filename = f"{pagename}.uml{idx+1}.txt"
+        filepath = os.path.join(output_dir, filename)
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(diagram_code)
+
+        result.append(filepath)
+        filename = f"{pagename}.uml{idx+1}.png"
+        filepath = os.path.join(output_dir, filename)
+
+        with open(filepath, 'wb') as f:
+            proc = subprocess.run(
+                ['plantuml', '-tpng', '-pipe'],
+                input=diagram_code.encode('utf-8'),
+                stdout=subprocess.PIPE
+            )
+            f.write(proc.stdout)
+
+
+        result.append(filepath)
+        print(f"   📊 Saved PlantUML diagram to {filepath}/.txt")
+
+    return result
+
 def create_page_hierarchy(wiki_dir):
     hierarchy = {}
     for fname in os.listdir(wiki_dir):
@@ -342,7 +451,6 @@ def upload_attachments_to_page(page_id, file_paths):
                 print(f"   ❌ Exception uploading {filename}: {e}")
                 continue
 
-
 def create_page(
     spaceid,
     title,
@@ -397,9 +505,18 @@ def create_page(
         "key": "content-appearance-published",
         "value": "full-width"
     }
-    response_fullwidth = requests.post(url_fullwidth, auth=auth, headers=JSON_HEADERS, json=data)
 
-    if response_fullwidth.status_code not in (200, 201):
+    for attempt in range(3):
+        response_fullwidth = requests.post(url_fullwidth, auth=auth, headers=JSON_HEADERS, json=data)
+
+        if response_fullwidth.status_code in (200, 201):
+            break;
+
+        if attempt < 2:
+            print(f"   ⚠️ Attempt {attempt+1} to set page '{title}' as full width failed: HTTP {response_fullwidth.status_code}\n{response_fullwidth.text}\nRetrying...")
+            sleep(2)
+            continue
+
         print(f"   ⚠️ Failed to set page '{title}' as full width: HTTP {response_fullwidth.status_code}\n{response_fullwidth.text}")
         raise Exception(f"Failed to set page '{title}' as full width: HTTP {response_fullwidth.status_code}\n{response_fullwidth.text}")
 
@@ -414,7 +531,7 @@ def create_confluence_wiki(wiki_dir):
 
     # First, create all root pages (no parent)
     for page, info in hierarchy.items():
-        title = f"{page} (Legacy)"
+        title = f"{page} ({CONFLUENCE_TITLE_SUFFIX})"
 
         if info['parent'] is None:
             print(f"➡️  Creating root page '{title}'...")
@@ -430,9 +547,19 @@ def create_confluence_wiki(wiki_dir):
             html_body = html_replace_img_with_confluence_macro(html_body, info['attachments'] + info['images'])
             html_body = html_convert_links(html_body)
             html_body = convert_code_blocks(html_body)
+            (html_body, umls) = convert_plantuml_blocks(html_body)
 
             with open(info['file'][:-4] + '.html', 'w', encoding='utf-8') as fhtml:
                 fhtml.write(html_body)
+
+            diagrams = save_plantuml_diagrams(page, umls, wiki_dir)
+
+            if CONFLUENCE_OVERWRITE_EXISTING and page in CONFLUENCE_OVERWRITE_EXISTING or '*' in CONFLUENCE_OVERWRITE_EXISTING:
+                existing_page_id = get_page_id(title, CONFLUENCE_SPACE_KEY)
+                if existing_page_id:
+                    print(f"   🗑️  Deleting existing page '{title}' with ID {existing_page_id}...")
+                    confluence.remove_page(existing_page_id)
+
             try:
             # print status, including emoji
                 result = create_page(
@@ -444,7 +571,7 @@ def create_confluence_wiki(wiki_dir):
                 )
                 page_id = created_pages[page] = result['id']
                 print(f"   ✅ Created page '{title}' with ID {result['id']}")
-                upload_attachments_to_page(page_id, info['attachments'] + info['images'])
+                upload_attachments_to_page(page_id, info['attachments'] + info['images'] + diagrams + [info['file']])
             except Exception as e:
                 error_str = str(e)
                 if "already exists" in error_str:
@@ -455,7 +582,7 @@ def create_confluence_wiki(wiki_dir):
                         continue
                     else:
                         created_pages[page] = page_id
-                        upload_attachments_to_page(page_id, info['attachments'] + info['images'])
+                        upload_attachments_to_page(page_id, info['attachments'] + info['images'] + diagrams + [info['file']])
                     continue
                 else:
                     print(f"⚠️ Exception while creating page '{title}': {e}")
@@ -469,10 +596,10 @@ def create_confluence_wiki(wiki_dir):
     while pages_remaining and progress:
         progress = False
         for page, info in list(pages_remaining.items()):
-            title = f"{page} (Legacy)"
+            title = f"{page} ({CONFLUENCE_TITLE_SUFFIX})"
             parent = info['parent']
             if parent in created_pages:
-                print(f"➡️  Creating child page '{title}' under parent '{parent} (Legacy)'...")
+                print(f"➡️  Creating child page '{title}' under parent '{parent} ({CONFLUENCE_TITLE_SUFFIX})'...")
 
                 with open(info['file'], 'r', encoding='utf-8') as f:
                     raw_content = f.read()
@@ -485,12 +612,21 @@ def create_confluence_wiki(wiki_dir):
                 html_body = html_replace_img_with_confluence_macro(html_body, info['attachments'] + info['images'])
                 html_body = html_convert_links(html_body)
                 html_body = convert_code_blocks(html_body)
+                (html_body, umls) = convert_plantuml_blocks(html_body)
 
                 with open(info['file'][:-4] + '.html', 'w', encoding='utf-8') as fhtml:
                     fhtml.write(html_body)
 
+                diagrams = save_plantuml_diagrams(page, umls, wiki_dir)
+
+                if CONFLUENCE_OVERWRITE_EXISTING and page in CONFLUENCE_OVERWRITE_EXISTING or '*' in CONFLUENCE_OVERWRITE_EXISTING:
+                    existing_page_id = get_page_id(title, CONFLUENCE_SPACE_KEY)
+                    if existing_page_id:
+                        print(f"   🗑️  Deleting existing page '{title}' with ID {existing_page_id}...")
+                        confluence.remove_page(existing_page_id)
+
                 try:
-                    print(f"➡️  Creating root page '{title}'...")
+                    print(f"➡️  Creating child page '{title}'...")
                     result = create_page(
                         spaceid=CONFLUENCE_SPACE_ID,
                         title=title,
@@ -500,7 +636,7 @@ def create_confluence_wiki(wiki_dir):
                     )
                     print(f"   ✅ Created page '{title}' with ID {result['id']}")
                     page_id = created_pages[page] = result['id']
-                    upload_attachments_to_page(page_id, info['attachments'] + info['images'])
+                    upload_attachments_to_page(page_id, info['attachments'] + info['images'] + diagrams + [info['file']])
                     del pages_remaining[page]
                     progress = True
                 except Exception as e:
@@ -513,7 +649,7 @@ def create_confluence_wiki(wiki_dir):
                             continue
                         else:
                             created_pages[page] = page_id
-                            upload_attachments_to_page(page_id, info['attachments'] + info['images'])
+                            upload_attachments_to_page(page_id, info['attachments'] + info['images'] + diagrams + [info['file']])
                             del pages_remaining[page]
                             progress = True
                         continue
@@ -589,8 +725,9 @@ def get_folder_id_by_name(folder_name):
 #  --confluence-space => Confluence space key
 #  --confluence-folder => Confluence parent forlder name
 #  --confluence-page-root => Confluence base page title (the one mapped to Wiki on redmine)
+#  --confiuence-page-suffix => suffix to add to all page titles (default: 'Legacy')
 #  --origin-url => Redmine instance URL
-#  --overwrite => overwrite (delete+create) existing issues
+#  --overwrite => overwrite (delete+create) existing pages passed (or '*' for all)
 #  --fail-fast => stop on first error
 #  --pages => comma-separated list of page titles to import (default: all)
 #  --help => show this help
@@ -604,8 +741,9 @@ def parse_args():
     parser.add_argument('--confluence-space', type=str, default=CONFLUENCE_SPACE_KEY, help='Confluence space key')
     parser.add_argument('--confluence-folder', type=str, help='Confluence parent folder name')
     parser.add_argument('--confluence-page-root', type=str, help='Confluence base page title (for mapping Wiki root)')
+    parser.add_argument('--confluence-page-suffix', type=str, default=CONFLUENCE_TITLE_SUFFIX, help='Suffix to add to all page titles')
     parser.add_argument('--origin-url', type=str, help='Original redmine instance URL (for link conversion)')
-    parser.add_argument('--overwrite', action='store_true', help='Overwrite existing pages')
+    parser.add_argument('--overwrite', type=str, help='Overwrite existing pages')
     parser.add_argument('--fail-fast', action='store_true', help='Stop on first error')
     parser.add_argument('--pages', type=str, help='Comma-separated list of page titles to import (default: all)')
     args = parser.parse_args()
@@ -615,8 +753,8 @@ def parse_args():
 def main():
     global wiki_dir, confluence, auth
     global CONFLUENCE_URL, CONFLUENCE_USER, CONFLUENCE_API_TOKEN, CONFLUENCE_PARENT_FOLDER
-    global CONFLUENCE_SPACE_ID, CONFLUENCE_SPACE_KEY, CONFLUENCE_PAGE_ROOT
-    global PAGES, FAIL_FAST, REDMINE_ORIGIN_URL
+    global CONFLUENCE_SPACE_ID, CONFLUENCE_SPACE_KEY, CONFLUENCE_PAGE_ROOT, CONFLUENCE_OVERWRITE_EXISTING
+    global PAGES, FAIL_FAST, REDMINE_ORIGIN_URL, CONFLUENCE_TITLE_SUFFIX
     args = parse_args()
 
     wiki_dir = args.input
@@ -626,6 +764,7 @@ def main():
     CONFLUENCE_SPACE_KEY = args.confluence_space
     CONFLUENCE_SPACE_ID = get_spaceid_by_key(CONFLUENCE_SPACE_KEY)
     CONFLUENCE_PAGE_ROOT = args.confluence_page_root
+    CONFLUENCE_OVERWRITE_EXISTING = args.overwrite.split(',') if args.overwrite else []
     REDMINE_ORIGIN_URL = args.origin_url
     FAIL_FAST = args.fail_fast
 
@@ -633,6 +772,9 @@ def main():
 
     if args.confluence_folder:
         CONFLUENCE_PARENT_FOLDER = get_folder_id_by_name(args.confluence_folder)
+
+    if args.confluence_page_suffix:
+        CONFLUENCE_TITLE_SUFFIX = args.confluence_page_suffix
 
     if args.pages:
         PAGES = [p.strip() for p in args.pages.split(',')]
