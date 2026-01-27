@@ -3,6 +3,7 @@ import re
 import subprocess
 import requests
 import textile
+import uuid
 import html as html_stdlib
 from pprint import pprint
 from atlassian import Confluence
@@ -183,6 +184,31 @@ def html_convert_links(html):
     return result
 
 
+def replace_redmine_toc(text: str) -> str:
+    """
+    Replace Redmine/Textile TOC macros ({{toc}}, {{<toc}}, {{>toc}}, case-insensitive)
+    with Confluence storage-format TOC structured macro.
+    """
+
+    toc_macro = (
+        '<ac:structured-macro ac:name="toc">'
+        '<ac:parameter ac:name="printable">true</ac:parameter>'
+        '</ac:structured-macro>'
+    )
+
+    # Matches:
+    # {{toc}}
+    # {{<toc}}
+    # {{>toc}}
+    # {{ toc }}
+    # {{< toc }}
+    pattern = re.compile(
+        r"\{\{\s*[<>]?\s*toc\s*\}\}",
+        re.IGNORECASE
+    )
+
+    return pattern.sub(toc_macro, text)
+
 # Matches an escaped inner <code class="bash"> ... </code> that lives inside <pre><code>...</code></pre>
 ESCAPED_INNER_CODE_RE = re.compile(
     r'^\s*<code\b([^>]*)>(.*?)</code>\s*$',
@@ -203,6 +229,11 @@ LANG_MAP = {
 def _safe_cdata(text: str) -> str:
     # CDATA cannot contain the literal "]]>" sequence
     return text.replace("]]>", "]]]]><![CDATA[>")
+
+def _encode_adf_parameter_text(value: str) -> str:
+    # Keep real newlines. Only XML-escape the minimum: &, <, >
+    # (quote=False keeps quotes as-is, which is fine in element text)
+    return html_stdlib.escape(value, quote=False)
 
 def _pick_lang_from_class_attr(class_value: str | None) -> str | None:
     """
@@ -279,90 +310,232 @@ def convert_code_blocks(html: str) -> str:
     return soup.encode(formatter=None).decode("utf-8")
 
 
-PLANTUML_HTML_RE = re.compile(r"\{\{plantuml\b(.*?)\}\}", re.IGNORECASE | re.DOTALL)
+PLANTUML_BLOCK_RE = re.compile(r"\{\{plantuml\b(.*?)\}\}", re.IGNORECASE | re.DOTALL)
 
-def convert_plantuml_blocks(html: str) -> str:
-    results = []
-    def repl(m: re.Match) -> str:
-        inner = m.group(1)
-
-        # Turn HTML line breaks into real newlines
-        inner = re.sub(r"(?is)<br\s*/?>", "\n", inner)
-
-        # Paragraph breaks to newlines
-        inner = re.sub(r"(?is)</p>\s*<p[^>]*>", "\n", inner)
-
-        # Drop any remaining tags inside the block
-        inner = re.sub(r"(?is)<[^>]+>", "", inner)
-
-        # Convert <code>...</code> if present
-        inner = inner.replace('<code>', '@')
-        inner = inner.replace('</code>', '@')
-
-        # Remove the leading newline(s) / spaces after {{plantuml
-        code = inner.strip()
-        code = code.replace("\r\n", "\n").replace("\r", "\n")
-
-        # Normalize some common unicode characters to ascii equivalents
-        code = (code
-            .replace("\u201c", '"')  # “
-            .replace("\u201d", '"')  # ”
-            .replace("’", "'")
-            .replace("→", "->")
-            .replace("—>", "-->")
-            .replace("–>", "-->")
-            .replace("—", "-")
-            .replace("–", "-")
-        )
-
-        if not code.startswith("@startuml"):
-            code = "@startuml\n" + code
-        if not code.endswith("@enduml") or code.endswith("@enduml\n"):
-            code = code + "\n@enduml"
-
-        results.append(code)
-        code = _safe_cdata(code)
-
-        return (
-            '<ac:structured-macro ac:name="plantuml-code">'
-            f'<ac:plain-text-body><![CDATA[{code}]]></ac:plain-text-body>'
-            '</ac:structured-macro>'
-        )
-
-    return (PLANTUML_HTML_RE.sub(repl, html), results)
-
-def save_plantuml_diagrams(pagename, diagrams, wiki_dir):
-    """ Saves PlantUML diagrams to files in output_dir, using pagename as base name. """
-    output_dir = os.path.join(wiki_dir, f"{pagename}_diagrams")
+def extract_plantuml_diagrams(pagename, textile, wiki_dir):
+    """ Extracts PlantUML diagrams from textile text. Returns list of diagram codes. """
     result = []
+    output_dir = os.path.join(wiki_dir, f"{pagename}_diagrams")
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    for idx, diagram_code in enumerate(diagrams):
-        filename = f"{pagename}.uml{idx+1}.txt"
-        filepath = os.path.join(output_dir, filename)
+    def repl(m: re.Match) -> str:
+        """Replaces PlantUML blocks with placeholder and stores diagram code."""
+        idx = len(result) + 1
+        code = m.group(1).strip()
+        code = code.replace('<br/>', '\n').replace('<br />', '\n')
+      
+        basename = f"{pagename}.uml{idx}"
+        filepath = os.path.join(output_dir, basename + '.txt')
 
         with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(diagram_code)
+            f.write(code)
 
         result.append(filepath)
-        filename = f"{pagename}.uml{idx+1}.png"
-        filepath = os.path.join(output_dir, filename)
+
+        filepath = os.path.join(output_dir, basename + '.png')
 
         with open(filepath, 'wb') as f:
             proc = subprocess.run(
                 ['plantuml', '-tpng', '-pipe'],
-                input=diagram_code.encode('utf-8'),
+                input=code.encode('utf-8'),
                 stdout=subprocess.PIPE
             )
             f.write(proc.stdout)
 
-
         result.append(filepath)
         print(f"   📊 Saved PlantUML diagram to {filepath}/.txt")
 
-    return result
+        return  f'{{{{plantuml:{pagename}.uml{idx}}}}}'
+
+    return (PLANTUML_BLOCK_RE.sub(repl, textile), result)
+
+PLANTUML_PLACEHOLDER_RE = re.compile(r"\{\{plantuml:(.*?)\}\}", re.IGNORECASE | re.DOTALL)
+
+# 1) Keep this as a mostly-static template copied from Confluence storage,
+#    and only substitute local-id and the PlantUML code payload.
+ADF_PLANTUML_TEMPLATE = """<ac:adf-extension>
+  <ac:adf-node type="extension">
+    <ac:adf-attribute key="extension-key">ef9c2b02-5cf5-49e3-8daa-1f9030cd772d/852e0f37-86e2-489f-8ecb-f8eac32a9bff/static/plantuml-diagram</ac:adf-attribute>
+    <ac:adf-attribute key="extension-type">com.atlassian.ecosystem</ac:adf-attribute>
+    <ac:adf-attribute key="parameters">
+      <ac:adf-parameter key="local-id">{local_id}</ac:adf-parameter>
+      <ac:adf-parameter key="extension-id">ari:cloud:ecosystem::extension/ef9c2b02-5cf5-49e3-8daa-1f9030cd772d/852e0f37-86e2-489f-8ecb-f8eac32a9bff/static/plantuml-diagram</ac:adf-parameter>
+      <ac:adf-parameter key="extension-title">PlantUML Diagram</ac:adf-parameter>
+      <ac:adf-parameter key="layout">extension</ac:adf-parameter>
+      <ac:adf-parameter key="forge-environment">PRODUCTION</ac:adf-parameter>
+      <ac:adf-parameter key="render">native</ac:adf-parameter>
+
+      <!-- You can keep the whole extension-properties block as-is (static) -->
+      {extension_properties_block}
+
+      <ac:adf-parameter key="guest-params">
+        <ac:adf-parameter key="plantuml-code">{plantuml_code}</ac:adf-parameter>
+        <ac:adf-parameter key="diagram-caption" />
+      </ac:adf-parameter>
+    </ac:adf-attribute>
+    <ac:adf-attribute key="text">PlantUML Diagram</ac:adf-attribute>
+    <ac:adf-attribute key="layout">default</ac:adf-attribute>
+    <ac:adf-attribute key="local-id">{local_id}</ac:adf-attribute>
+  </ac:adf-node>
+
+  <!-- Fallback: safest is to keep it too (same local-id + plantuml-code) -->
+  <ac:adf-fallback>
+    <ac:adf-node type="extension">
+      <ac:adf-attribute key="extension-key">ef9c2b02-5cf5-49e3-8daa-1f9030cd772d/852e0f37-86e2-489f-8ecb-f8eac32a9bff/static/plantuml-diagram</ac:adf-attribute>
+      <ac:adf-attribute key="extension-type">com.atlassian.ecosystem</ac:adf-attribute>
+      <ac:adf-attribute key="parameters">
+        <ac:adf-parameter key="local-id">{local_id}</ac:adf-parameter>
+        <ac:adf-parameter key="extension-id">ari:cloud:ecosystem::extension/ef9c2b02-5cf5-49e3-8daa-1f9030cd772d/852e0f37-86e2-489f-8ecb-f8eac32a9bff/static/plantuml-diagram</ac:adf-parameter>
+        <ac:adf-parameter key="extension-title">PlantUML Diagram</ac:adf-parameter>
+        <ac:adf-parameter key="layout">extension</ac:adf-parameter>
+        <ac:adf-parameter key="forge-environment">PRODUCTION</ac:adf-parameter>
+        <ac:adf-parameter key="render">native</ac:adf-parameter>
+
+        {extension_properties_block}
+
+        <ac:adf-parameter key="guest-params">
+          <ac:adf-parameter key="plantuml-code">{plantuml_code}</ac:adf-parameter>
+          <ac:adf-parameter key="diagram-caption" />
+        </ac:adf-parameter>
+      </ac:adf-attribute>
+      <ac:adf-attribute key="text">PlantUML Diagram</ac:adf-attribute>
+      <ac:adf-attribute key="layout">default</ac:adf-attribute>
+      <ac:adf-attribute key="local-id">{local_id}</ac:adf-attribute>
+    </ac:adf-node>
+  </ac:adf-fallback>
+</ac:adf-extension>
+"""
+
+EXTENSION_PROPERTIES_BLOCK_XML = """
+<ac:adf-parameter key="extension-properties">
+  <ac:adf-parameter key="extension">
+    <ac:adf-parameter key="id">ari:cloud:ecosystem::extension/ef9c2b02-5cf5-49e3-8daa-1f9030cd772d/852e0f37-86e2-489f-8ecb-f8eac32a9bff/static/plantuml-diagram</ac:adf-parameter>
+    <ac:adf-parameter key="app-id">ef9c2b02-5cf5-49e3-8daa-1f9030cd772d</ac:adf-parameter>
+    <ac:adf-parameter key="key">plantuml-diagram</ac:adf-parameter>
+    <ac:adf-parameter key="environment-id">852e0f37-86e2-489f-8ecb-f8eac32a9bff</ac:adf-parameter>
+    <ac:adf-parameter key="environment-type">PRODUCTION</ac:adf-parameter>
+    <ac:adf-parameter key="environment-key">production</ac:adf-parameter>
+    <ac:adf-parameter key="properties">
+      <ac:adf-parameter key="resolver">
+        <ac:adf-parameter key="function">resolver</ac:adf-parameter>
+      </ac:adf-parameter>
+      <ac:adf-parameter key="resource-upload-id">ee71ebb8-d311-4733-993f-e0a1219b9deb</ac:adf-parameter>
+      <ac:adf-parameter key="resource">main</ac:adf-parameter>
+      <ac:adf-parameter key="description">Insert a PlantUML diagram</ac:adf-parameter>
+      <ac:adf-parameter key="title">PlantUML Diagram</ac:adf-parameter>
+      <ac:adf-parameter key="type">xen:macro</ac:adf-parameter>
+      <ac:adf-parameter key="config">
+        <ac:adf-parameter key="render">native</ac:adf-parameter>
+        <ac:adf-parameter key="resource">macro-config</ac:adf-parameter>
+        <ac:adf-parameter key="title">Config</ac:adf-parameter>
+        <ac:adf-parameter key="viewport-size">max</ac:adf-parameter>
+      </ac:adf-parameter>
+      <ac:adf-parameter key="render">native</ac:adf-parameter>
+      <ac:adf-parameter key="key">plantuml-diagram</ac:adf-parameter>
+    </ac:adf-parameter>
+    <ac:adf-parameter key="type">xen:macro</ac:adf-parameter>
+    <ac:adf-parameter key="installation-id">004e7bcc-0264-4c9f-9efd-6e666fec9a42</ac:adf-parameter>
+    <ac:adf-parameter key="app-version">4.6.0</ac:adf-parameter>
+    <ac:adf-parameter key="consent-url">
+      https://id.atlassian.com/outboundAuth/start?containerId=ef9c2b02-5cf5-49e3-8daa-1f9030cd772d_852e0f37-86e2-489f-8ecb-f8eac32a9bff&amp;serviceKey=atlassian-token-service-key&amp;cloudId=89d3bff6-9bc0-46ac-b8b2-2675da332bd2&amp;isAccountBased=true
+    </ac:adf-parameter>
+    <ac:adf-parameter key="egress">
+      <ac:adf-parameter-value>
+        <ac:adf-parameter key="type">IMAGES</ac:adf-parameter>
+        <ac:adf-parameter key="addresses">
+          <ac:adf-parameter-value>*</ac:adf-parameter-value>
+        </ac:adf-parameter>
+      </ac:adf-parameter-value>
+    </ac:adf-parameter>
+    <ac:adf-parameter key="scopes">
+      <ac:adf-parameter-value>storage:app</ac:adf-parameter-value>
+    </ac:adf-parameter>
+    <ac:adf-parameter key="data-classification-policy-decision">
+      <ac:adf-parameter key="status">ALLOWED</ac:adf-parameter>
+    </ac:adf-parameter>
+  </ac:adf-parameter>
+
+  <ac:adf-parameter key="extension-data">
+    <ac:adf-parameter key="type">macro</ac:adf-parameter>
+    <ac:adf-parameter key="content">
+      <ac:adf-parameter key="id">980516953</ac:adf-parameter>
+      <ac:adf-parameter key="type">page</ac:adf-parameter>
+    </ac:adf-parameter>
+    <ac:adf-parameter key="space">
+      <ac:adf-parameter key="key">CC</ac:adf-parameter>
+      <ac:adf-parameter key="id">62193670</ac:adf-parameter>
+    </ac:adf-parameter>
+  </ac:adf-parameter>
+
+  <ac:adf-parameter key="account-id">712020:07f889b0-12d3-4dbc-b399-68b5c3c0b16a</ac:adf-parameter>
+  <ac:adf-parameter key="cloud-id">89d3bff6-9bc0-46ac-b8b2-2675da332bd2</ac:adf-parameter>
+  <ac:adf-parameter key="context-ids">
+    <ac:adf-parameter-value>
+      ari:cloud:confluence:89d3bff6-9bc0-46ac-b8b2-2675da332bd2:workspace/48bd2efc-e9d6-49e3-a354-680e860c8532
+    </ac:adf-parameter-value>
+  </ac:adf-parameter>
+</ac:adf-parameter>
+""".strip()
+
+def _normalize_plantuml(code: str) -> str:
+    # Normalize newlines
+    code = code.strip().replace("\r\n", "\n").replace("\r", "\n")
+
+    # Normalize common unicode chars to ASCII-ish equivalents
+    code = (code
+        .replace("\u201c", '"')  # “
+        .replace("\u201d", '"')  # ”
+        .replace("’", "'")
+        .replace("→", "->")
+        .replace("—>", "-->")
+        .replace("–>", "-->")
+        .replace("—", "-")
+        .replace("–", "-")
+    )
+
+    # Ensure proper @startuml / @enduml
+    if code.startswith("startuml\n"):
+        code = code.replace("startuml\n", "@startuml\n", 1)
+    if not code.startswith("@startuml"):
+        code = "@startuml\n" + code
+
+    stripped = code.rstrip()
+    if stripped.endswith("enduml") and not stripped.endswith("@enduml"):
+        stripped = stripped[:-6] + "@enduml"
+        code = stripped
+
+    if not code.rstrip().endswith("@enduml"):
+        code = code.rstrip() + "\n@enduml"
+
+    return code
+
+def replace_plantuml_placeholders(pagename: str, html_text: str) -> str:
+    def repl(m: re.Match) -> str:
+        filename = m.group(1) + ".txt"
+        basedir = os.path.join(wiki_dir, f"{pagename}_diagrams")
+        filepath = os.path.join(basedir, filename)
+
+        with open(filepath, "r", encoding="utf-8") as f:
+            raw = f.read()
+
+        code = _normalize_plantuml(raw)
+        plantuml_code = _encode_adf_parameter_text(code)
+
+        local_id = str(uuid.uuid4())
+
+        # Put here the exact <ac:adf-parameter key="extension-properties">...</ac:adf-parameter>
+        # block you extracted (static). If you want, store it as a constant string.
+        extension_properties_block = EXTENSION_PROPERTIES_BLOCK_XML
+
+        return ADF_PLANTUML_TEMPLATE.format(
+            local_id=local_id,
+            plantuml_code=plantuml_code,
+            extension_properties_block=extension_properties_block,
+        )
+
+    return PLANTUML_PLACEHOLDER_RE.sub(repl, html_text)
 
 def create_page_hierarchy(wiki_dir):
     hierarchy = {}
@@ -543,16 +716,16 @@ def create_confluence_wiki(wiki_dir):
                 body = raw_content[split+5:]
             else:
                 body = raw_content
+            (body, diagrams) = extract_plantuml_diagrams(page, body, wiki_dir)
             html_body = textile_to_html(body)
             html_body = html_replace_img_with_confluence_macro(html_body, info['attachments'] + info['images'])
             html_body = html_convert_links(html_body)
             html_body = convert_code_blocks(html_body)
-            (html_body, umls) = convert_plantuml_blocks(html_body)
+            html_body = replace_redmine_toc(html_body)
+            html_body = replace_plantuml_placeholders(page, html_body)
 
             with open(info['file'][:-4] + '.html', 'w', encoding='utf-8') as fhtml:
                 fhtml.write(html_body)
-
-            diagrams = save_plantuml_diagrams(page, umls, wiki_dir)
 
             if CONFLUENCE_OVERWRITE_EXISTING and page in CONFLUENCE_OVERWRITE_EXISTING or '*' in CONFLUENCE_OVERWRITE_EXISTING:
                 existing_page_id = get_page_id(title, CONFLUENCE_SPACE_KEY)
@@ -608,16 +781,16 @@ def create_confluence_wiki(wiki_dir):
                     body = raw_content[split+5:]
                 else:
                     body = raw_content
+                (body, diagrams) = extract_plantuml_diagrams(page, body, wiki_dir)
                 html_body = textile_to_html(body)
                 html_body = html_replace_img_with_confluence_macro(html_body, info['attachments'] + info['images'])
                 html_body = html_convert_links(html_body)
                 html_body = convert_code_blocks(html_body)
-                (html_body, umls) = convert_plantuml_blocks(html_body)
+                html_body = replace_redmine_toc(html_body)
+                html_body = replace_plantuml_placeholders(page, html_body)
 
                 with open(info['file'][:-4] + '.html', 'w', encoding='utf-8') as fhtml:
                     fhtml.write(html_body)
-
-                diagrams = save_plantuml_diagrams(page, umls, wiki_dir)
 
                 if CONFLUENCE_OVERWRITE_EXISTING and page in CONFLUENCE_OVERWRITE_EXISTING or '*' in CONFLUENCE_OVERWRITE_EXISTING:
                     existing_page_id = get_page_id(title, CONFLUENCE_SPACE_KEY)
