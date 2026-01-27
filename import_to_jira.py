@@ -25,7 +25,8 @@ issue_type_map = {
     "Feature" : "New Feature",
     "Support" : "Support",
     "Task" : "Task",
-    "Incident" : "Incident",
+    #"Incident" : "Incident",
+    "Incident" : "Support"
 }
 
 priority_map = {
@@ -168,7 +169,9 @@ def get_field_id_for(field_name):
 def get_redmine_custom_field_value(redmine_issue, field_name):
     for field in redmine_issue.get("custom_fields", []):
         if field.get("name", None) == field_name:
-            return field.get("value", None)
+            value = field.get("value", None)
+            if value:
+                return value.strip()
     return None
 
 def preprocess_redmine_plaintext(text):
@@ -616,6 +619,65 @@ def create_jira_issue(redmine_issue):
 
     return issue_key
 
+# Updates jira issue from redmine data:
+#  - Uploads new txt files
+#  - Uploads new attachments
+#  - Updates missing state transitions
+def update_jira_issue(issue_key, redmine_issue):
+    summary = redmine_issue.get('subject', 'No subject')
+    print(f"➡️ Updating Jira issue {issue_key} for Redmine #{redmine_issue.get('id')}: {summary}")
+    # Always attach the .txt and comments.txt for each issue
+    #issue_id = redmine_issue.get('id')
+    #txt_path = os.path.join(redmine_issues_folder, f"issue_{issue_id}.txt")
+    
+    # Always attach the .txt and comments.txt for each issue
+    issue_id = redmine_issue.get('id')
+    created_on_str = redmine_issue.get('created_on', None)
+    created_on = datetime.strptime(created_on_str, "%Y-%m-%dT%H:%M:%SZ")
+    updated_on_str = redmine_issue.get('updated_on', None)
+    updated_on = datetime.strptime(updated_on_str, "%Y-%m-%dT%H:%M:%SZ") if updated_on_str else None
+    txt_path = os.path.join(redmine_issues_folder, f"issue_{issue_id}.txt")
+    comments_txt_path = os.path.join(redmine_issues_folder, f"issue_{issue_id}_comments.txt")
+
+    # Prepare main Jira issue payload
+    kind = redmine_issue.get('tracker', {}).get('name', 'Task')
+    status = redmine_issue.get('status', {}).get('name', 'New')
+    status_jira = status_map.get(status, "NEW")
+    priority = redmine_issue.get('priority', {}).get('name', 'Medium')
+    priority_jira = priority_map.get(priority, "Medium")
+    reporter = redmine_issue.get('author', {}).get('name', None)
+    reporter_id = try_get_user_id_for(reporter) if reporter else None
+    assignee = redmine_issue.get('assigned_to', {}).get('name', None)
+    assignee_id = try_get_user_id_for(assignee) if assignee else None
+    redmineid_fieldid = get_field_id_for("Redmine ID")
+    environment_fieldid = get_field_id_for("Environment")
+    environment = get_redmine_custom_field_value(redmine_issue, "Environment")
+    resolution = get_redmine_custom_field_value(redmine_issue, "Resolution")
+
+    # TODO: Add new txt files if updated
+    # TODO: add new attachments from Redmine to Jira
+
+    gitbranch = get_redmine_custom_field_value(redmine_issue, "Git Branch")
+    if gitbranch:
+        if len(gitbranch) > 255:
+            gitbranch = gitbranch[:252] + "..."
+        gitbranch_fieldid = get_field_id_for("Git Branch / Pull Request")
+
+    # Now let's update status..
+    if status_jira in ['REJECTED', 'RESOLVED', 'CLOSED']:
+        fields = {
+            'Assignee': { "id": (assignee_id or assignee_id or try_get_user_id_for(JIRA_USER)) },
+            'Start date': (updated_on if updated_on else created_on).strftime("%Y-%m-%d"),
+            '% Done': 100,
+            'Git Branch / Pull Request': (gitbranch or '*missing*'),
+            'Resolution' : { "name": resolution_map.get(get_redmine_custom_field_value(redmine_issue, "Resolution"), "Done") },
+            'Priority Reason / Notes:' : adf_basic_document(f"Imported from Redmine with priority '{priority}', see details in issue body."),
+        }
+        if not transition_jira_issue_to(issue_key, status_jira, fields):
+            raise Exception("Failed to transition issue")
+    elif redmine_issue.get('fixed_version', {}).get('name', None) == 'Backlog':
+        if not transition_jira_issue_to(issue_key, 'BACKLOG'):
+            raise Exception("Failed to transition issue")
 
 def upload_attachments_to_jira(issue_key, attachment_folder):
     if not os.path.exists(attachment_folder):
@@ -642,7 +704,7 @@ def check_jira_issue_exists(redmine_issue):
     issue_id = redmine_issue.get('id')
     jql = f'"{redmineid_fieldid}" ~ "{issue_id}"'
     resp = requests.post(
-        f"{JIRA_URL}/rest/api/3/search/approximate-count",
+       f"{JIRA_URL}/rest/api/3/search/approximate-count",
         auth=auth,
         headers={"Content-Type": "application/json"},
         json={"jql": jql}
@@ -693,9 +755,11 @@ def delete_jira_issue(issue_key):
 #  --errorlog => path to log file for errors
 #  --skip-closed => skip closed issues
 #  --issue-id => only import specific issue ID
+#  --issue-ids => only import specific issue IDs (comma-separated)
 #  --start-id => start importing from specific Redmine issue ID
 #  --overwrite => overwrite (delete+create) existing issues
 #  --fail-fast => stop on first error
+#  --update => update existing issues instead of creating new ones
 #  --help => show this help
 def parse_args():
     import argparse
@@ -709,9 +773,11 @@ def parse_args():
     parser.add_argument("--errorlog", type=str, help="Path to log file for errors")
     parser.add_argument("--skip-closed", action="store_true", help="Skip closed issues")
     parser.add_argument("--issue-id", type=int, help="Only import specific issue ID")
+    parser.add_argument("--issue-ids", type=str, help="Only import specific issue IDs (comma-separated)")
     parser.add_argument("--start-id", type=int, help="Start importing from specific Redmine issue ID")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite (delete+create) existing issues")
     parser.add_argument("--fail-fast", action="store_true", help="Stop on first error")
+    parser.add_argument("--update", action="store_true", help="Update existing issues instead of creating new ones")
     return parser.parse_args()
 
 def readfile(path):
@@ -753,6 +819,10 @@ def main():
      
     errfile =  open(args.errorlog, "a", encoding="utf-8") if args.errorlog else None
 
+    issue_ids_filter = None
+    if args.issue_ids:
+        issue_ids_filter = set(int(i) for i in args.issue_ids.split(",") if i.strip().isdigit())
+
     for fname in sorted(os.listdir(redmine_issues_folder), key=extract_issueid_from):
         if not fname.endswith(".json"):
             continue
@@ -760,6 +830,9 @@ def main():
             redmine_issue = json.load(f)
 
         if args.issue_id and redmine_issue.get('id') != args.issue_id:
+            continue
+
+        if issue_ids_filter and redmine_issue.get('id') not in issue_ids_filter:
             continue
 
         if args.start_id and redmine_issue.get('id') < args.start_id:
@@ -771,6 +844,23 @@ def main():
             if status in ['Closed', 'Rejected']:
                 print(f"⏭️  Skipping closed issue Redmine #{redmine_issue.get('id')} with status '{status}'")
                 continue
+
+        if args.update:
+            id = maybe_get_jiraids_for(redmine_issue)
+            if not id or len(id) == 0:
+                print(f"❌ Failing fast: No existing Jira issue found for Redmine #{redmine_issue.get('id')}")
+                if args.fail_fast:
+                    raise Exception(f"No existing Jira issue found for Redmine #{redmine_issue.get('id')}")
+                continue
+            elif len(id) > 1:
+                print(f"❌ Failing fast: Multiple existing Jira issues found for Redmine #{redmine_issue.get('id')} -> {ids}")
+                if args.fail_fast:
+                    raise Exception(f"Multiple existing Jira issues found for Redmine #{redmine_issue.get('id')} -> {ids}")
+                continue
+            issue_key = id[0]
+            print(f"✏️  Updating existing Jira issue {issue_key} for Redmine #{redmine_issue.get('id')}")
+            update_jira_issue(issue_key, redmine_issue)
+            continue
 
         if args.overwrite:
             ids = maybe_get_jiraids_for(redmine_issue)
@@ -793,7 +883,7 @@ def main():
             raise Exception(f"Failed to import Redmine issue #{redmine_issue.get('id')}")
         elif errfile:
             errfile.write(f"Failed to import Redmine issue #{redmine_issue.get('id')}\n")
-        time.sleep(0.6)  # Polite delay
+        time.sleep(0.250)  # Polite delay
 
 if __name__ == "__main__":
     main()
